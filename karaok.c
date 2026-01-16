@@ -4,10 +4,9 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <alsa/asoundlib.h>
+#include <signal.h>
 
 #include "ringbuf.h"
-//#include "reverb.h"
-//#include "freeverbwrap.h"
 #include "reverb_engine.h"
 
 
@@ -18,13 +17,15 @@
 #define PERIOD_SIZE	1024
 #define BUF_PERIODS	4
 
-#define BUFFER_TIME   500000  // 0.5 秒 (微秒)
-#define CAPTURE_PERIOD_TIME   10000  // 0.1 秒
-#define PLAY_PERIOD_TIME	  20000
+#define BUFFER_TIME   200000  // 200 ms
+#define CAPTURE_PERIOD_TIME   10000  // 10ms
+#define PLAY_PERIOD_TIME	  20000  // 20ms
 
 
 static ring_buffer_t g_ring;
 static volatile int g_running = 1;
+static pthread_t alsa_capture;
+static pthread_t alsa_playback;
 
 static inline size_t frame_to_bytes(snd_pcm_uframes_t frames)
 {
@@ -38,9 +39,6 @@ static void *capture_thread(void *arg)
 	snd_pcm_hw_params_t *hw_params;
 	snd_pcm_sw_params_t *sw_params;
 	char *buffer;
-	snd_pcm_uframes_t frames = PERIOD_SIZE;
-	//size_t bytes_per_frame = frame_to_bytes(1);
-	size_t buffer_bytes = frame_to_bytes(frames);
 	unsigned int buffer_time = BUFFER_TIME;
 	unsigned int period_time = CAPTURE_PERIOD_TIME;
 
@@ -57,14 +55,8 @@ static void *capture_thread(void *arg)
 	snd_pcm_hw_params_set_channels(capture_handle, hw_params, CHANNELS);
 	unsigned int rate = SAMPLE_RATE;
 	snd_pcm_hw_params_set_rate_near(capture_handle, hw_params, &rate, 0);
-	#if 0
-	snd_pcm_hw_params_set_period_size_near(capture_handle, hw_params, &frames, 0);
-	snd_pcm_uframes_t buffer_size = frames * BUF_PERIODS;
-	snd_pcm_hw_params_set_buffer_size_near(capture_handle, hw_params, &buffer_size);
-	#else
 	snd_pcm_hw_params_set_buffer_time_near(capture_handle, hw_params, &buffer_time, NULL);
 	snd_pcm_hw_params_set_period_time_near(capture_handle, hw_params, &period_time, NULL);
-	#endif
 	snd_pcm_hw_params(capture_handle, hw_params);
 
 	snd_pcm_uframes_t period_size;
@@ -124,10 +116,8 @@ static void *playback_thread(void *arg)
 	snd_pcm_sw_params_t *sw_params;
 	char *buffer;
 	unsigned int rate = SAMPLE_RATE;
-	snd_pcm_uframes_t frames = PERIOD_SIZE;
-	//size_t bytes_per_frame = frame_to_bytes(1);
-	size_t buffer_bytes = frame_to_bytes(frames);
-	snd_pcm_uframes_t buffer_size = frames * BUF_PERIODS;
+	//snd_pcm_uframes_t frames = PERIOD_SIZE;
+	//snd_pcm_uframes_t buffer_size = frames * BUF_PERIODS;
 	unsigned int buffer_time = BUFFER_TIME;
 	unsigned int period_time = PLAY_PERIOD_TIME;
 
@@ -144,19 +134,14 @@ static void *playback_thread(void *arg)
 	snd_pcm_hw_params_set_channels(playback_handle, hw_params, CHANNELS);
 
 	snd_pcm_hw_params_set_rate_near(playback_handle, hw_params, &rate, 0);
-	#if 0
-	snd_pcm_hw_params_set_period_size_near(playback_handle, hw_params, &frames, 0);
-
-	snd_pcm_hw_params_set_buffer_size_near(playback_handle, hw_params, &buffer_size);
-	#else
 	snd_pcm_hw_params_set_buffer_time_near(playback_handle, hw_params, &buffer_time, NULL);
 	snd_pcm_hw_params_set_period_time_near(playback_handle, hw_params, &period_time, NULL);
-	#endif
 	snd_pcm_hw_params(playback_handle, hw_params);
 
+	snd_pcm_uframes_t play_start_buffer_size = 3 * rate * PLAY_PERIOD_TIME / (1000 * 1000);
 	snd_pcm_sw_params_alloca(&sw_params);
 	snd_pcm_sw_params_current(playback_handle, sw_params);
-	snd_pcm_sw_params_set_start_threshold(playback_handle, sw_params, buffer_size);
+	snd_pcm_sw_params_set_start_threshold(playback_handle, sw_params, play_start_buffer_size);
 	snd_pcm_sw_params(playback_handle, sw_params);
 
 	snd_pcm_prepare(playback_handle);
@@ -186,11 +171,7 @@ static void *playback_thread(void *arg)
 			break;
 		struct timespec prbegin, prend;
 		clock_gettime(CLOCK_MONOTONIC, &prbegin);
-#if 0
-		if (rv)
-			reverb_process_block(rv, (short *)buffer, period_size * CHANNELS);
-		//freeverb_process((int16_t *)buffer, (int16_t *)buffer, period_size * CHANNELS);
-#endif
+
 		reverb_engine_process(buffer, period_size * CHANNELS);
 
 		clock_gettime(CLOCK_MONOTONIC, &prend);
@@ -210,7 +191,24 @@ static void *playback_thread(void *arg)
 	}
 	free(buffer);
 	snd_pcm_close(playback_handle);
+	printf("playback thread exit.\n");
+
 	return NULL;
+}
+
+static void signal_handler(int sig)
+{
+	if (SIGINT == sig) {
+		g_running = 0;
+		reverb_engine_destroy();
+		pthread_join(alsa_capture, NULL);
+		pthread_join(alsa_playback, NULL);
+		if (g_ring.buffer) {
+			free(g_ring.buffer);
+			g_ring.buffer = NULL;
+		}
+		printf("karaok stopped!\n");
+	}
 }
 
 int main(int argc, char **argv)
@@ -224,43 +222,25 @@ int main(int argc, char **argv)
 		printf("fail to init ring buffer\n");
 		return -1;
 	}
-#if 0
-	reverb_t *rv = reverb_create(10);
-	if (!rv) {
-		printf("Failed to create reverb\n");
-		return -1;
-	}
-	reverb_set_param(rv, "rt60", 3.0f);
-	reverb_set_param(rv, "room_size", 0.8f);
-	reverb_set_param(rv, "wet_gain", 0.8f);
 
-	freeverb_create();
-#endif
+	signal(SIGINT, signal_handler);
+
 	reverb_engine_create(FREE_REVERB, SAMPLE_RATE);
 	//reverb_engine_create(FIR_REVERB, SAMPLE_RATE);
 	reverb_engine_set_params(0.8f, 3.0f, 0.6f, 0.6f);
 
-	pthread_t th_capture, th_playback;
-	if (pthread_create(&th_capture, NULL, capture_thread, NULL) != 0 ||
-		pthread_create(&th_playback, NULL, playback_thread, NULL) != 0) {
+
+	if (pthread_create(&alsa_capture, NULL, capture_thread, NULL) != 0 ||
+		pthread_create(&alsa_playback, NULL, playback_thread, NULL) != 0) {
 		printf("Fail to create threads\n");
 		g_running = 0;
 		return -1;
 	}
 
-	printf("Loopback running... Press Enter to stop.\n");
+	printf("Loopback running... Press Ctrl+C to stop.\n");
 	pause();
-	g_running = 0;
-#if 0
-	freeverb_destroy();
-	reverb_destroy(rv);
-#endif
-	reverb_engine_destroy();
-	pthread_join(th_capture, NULL);
-	pthread_join(th_playback, NULL);
 
-	free(g_ring.buffer);
-	printf("test stopped!\n");
+	printf("karaok exit!\n");
 
 	return 0;
 }

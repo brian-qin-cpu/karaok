@@ -77,6 +77,7 @@ void reverb_destroy(reverb_t *rv)
 		free(rv->ir_buffer);
 		free(rv->delay_line);
 		free(rv);
+		rv = NULL;
 	}
 }
 
